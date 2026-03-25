@@ -24,34 +24,56 @@ export class QueryCache {
   /**
    * Resolve a query — return cached result or compute.
    * @param {Array<{ _id: number }>} types
-   * @param {Map<number, Map<number, object>>} stores
+   * @param {Map<number, { soa: object, membership: import("./Bitset.js").Bitset }>} stores
+   * @param {Uint16Array} generations — per-slot generation values
+   * @param {number} indexBits — number of bits for slot index (e.g. 20)
    * @returns {number[]}
    */
-  resolve(types, stores) {
+  resolve(types, stores, generations, indexBits) {
     const key = this._key(types);
     const cached = this._cache.get(key);
     if (cached) return cached;
 
-    // Find the smallest store to iterate
+    // Collect entries, bail early if any store is missing
     let smallest = null;
-    let smallestSize = Infinity;
+    let smallestCount = Infinity;
+    const entries = [];
     for (const type of types) {
-      const store = stores.get(type._id);
-      const size = store ? store.size : 0;
-      if (size < smallestSize) {
-        smallestSize = size;
-        smallest = store;
+      const entry = stores.get(type._id);
+      if (!entry) {
+        // No store for this type → no entities match
+        const empty = [];
+        this._cache.set(key, empty);
+        for (const t of types) {
+          let set = this._index.get(t._id);
+          if (!set) { set = new Set(); this._index.set(t._id, set); }
+          set.add(key);
+        }
+        return empty;
+      }
+      const cnt = entry.membership.count();
+      entries.push(entry);
+      if (cnt < smallestCount) {
+        smallestCount = cnt;
+        smallest = entry;
       }
     }
 
     const result = [];
-    if (smallest) {
-      const others = types
-        .map((t) => stores.get(t._id))
-        .filter((s) => s !== smallest);
-      for (const entity of smallest.keys()) {
-        if (others.every((s) => s && s.has(entity))) {
-          result.push(entity);
+    if (smallest && smallestCount > 0) {
+      const others = entries.filter((e) => e !== smallest);
+      const words = smallest.membership._words;
+      const len = words.length;
+      for (let w = 0; w < len; w++) {
+        let mask = words[w];
+        while (mask !== 0) {
+          const lsb = mask & (-mask);
+          const bit = 31 - Math.clz32(lsb);
+          const slotIndex = (w << 5) + bit;
+          if (others.every((e) => e.membership.has(slotIndex))) {
+            result.push((generations[slotIndex] << indexBits) | slotIndex);
+          }
+          mask ^= lsb;
         }
       }
     }

@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { QueryCache } from "../src/Query.js";
+import { Bitset } from "../src/Bitset.js";
+
+const INDEX_BITS = 20;
 
 function makeType(id) {
   return { _id: id, name: `T${id}`, defaults: {} };
@@ -8,14 +11,16 @@ function makeType(id) {
 function makeStores(...entries) {
   const stores = new Map();
   for (const [typeId, entityIds] of entries) {
-    const store = new Map();
-    for (const eid of entityIds) {
-      store.set(eid, {});
-    }
-    stores.set(typeId, store);
+    const membership = new Bitset(1024);
+    for (const eid of entityIds) membership.set(eid);
+    stores.set(typeId, { soa: null, membership });
   }
   return stores;
 }
+
+// All entity IDs in these tests are small integers with generation 0,
+// so (0 << 20) | slot === slot. We use a shared generations array.
+const generations = new Uint16Array(1024);
 
 describe("QueryCache", () => {
   it("resolves a single-component query", () => {
@@ -23,8 +28,8 @@ describe("QueryCache", () => {
     const A = makeType(0);
     const stores = makeStores([0, [1, 2, 3]]);
 
-    const result = cache.resolve([A], stores);
-    expect(result).toEqual([1, 2, 3]);
+    const result = cache.resolve([A], stores, generations, INDEX_BITS);
+    expect(result.sort()).toEqual([1, 2, 3]);
   });
 
   it("resolves a multi-component query (intersection)", () => {
@@ -36,7 +41,7 @@ describe("QueryCache", () => {
       [1, [2, 3, 4]],
     );
 
-    const result = cache.resolve([A, B], stores);
+    const result = cache.resolve([A, B], stores, generations, INDEX_BITS);
     expect(result.sort()).toEqual([2, 3]);
   });
 
@@ -45,8 +50,8 @@ describe("QueryCache", () => {
     const A = makeType(0);
     const stores = makeStores([0, [1]]);
 
-    const first = cache.resolve([A], stores);
-    const second = cache.resolve([A], stores);
+    const first = cache.resolve([A], stores, generations, INDEX_BITS);
+    const second = cache.resolve([A], stores, generations, INDEX_BITS);
     expect(first).toBe(second); // same reference
   });
 
@@ -55,14 +60,14 @@ describe("QueryCache", () => {
     const A = makeType(0);
     const stores = makeStores([0, [1]]);
 
-    const first = cache.resolve([A], stores);
+    const first = cache.resolve([A], stores, generations, INDEX_BITS);
     cache.invalidate(0);
-    // Add entity 2 to the store
-    stores.get(0).set(2, {});
-    const second = cache.resolve([A], stores);
+    // Add entity 2 to the membership
+    stores.get(0).membership.set(2);
+    const second = cache.resolve([A], stores, generations, INDEX_BITS);
 
     expect(first).not.toBe(second);
-    expect(second).toEqual([1, 2]);
+    expect(second.sort()).toEqual([1, 2]);
   });
 
   it("returns empty array when a store is missing", () => {
@@ -71,7 +76,7 @@ describe("QueryCache", () => {
     const B = makeType(1);
     const stores = makeStores([0, [1, 2]]);
 
-    const result = cache.resolve([A, B], stores);
+    const result = cache.resolve([A, B], stores, generations, INDEX_BITS);
     expect(result).toEqual([]);
   });
 
@@ -85,7 +90,7 @@ describe("QueryCache", () => {
       [1, [3]],
     );
 
-    const result = cache.resolve([A, B], stores);
+    const result = cache.resolve([A, B], stores, generations, INDEX_BITS);
     expect(result).toEqual([3]);
   });
 
@@ -94,13 +99,13 @@ describe("QueryCache", () => {
     const A = makeType(0);
     const stores = makeStores([0, [1]]);
 
-    const first = cache.resolve([A], stores);
+    const first = cache.resolve([A], stores, generations, INDEX_BITS);
     cache.clear();
-    stores.get(0).set(2, {});
-    const second = cache.resolve([A], stores);
+    stores.get(0).membership.set(2);
+    const second = cache.resolve([A], stores, generations, INDEX_BITS);
 
     expect(first).not.toBe(second);
-    expect(second).toEqual([1, 2]);
+    expect(second.sort()).toEqual([1, 2]);
   });
 
   it("query key is order-independent", () => {
@@ -112,8 +117,8 @@ describe("QueryCache", () => {
       [1, [2, 3]],
     );
 
-    const ab = cache.resolve([A, B], stores);
-    const ba = cache.resolve([B, A], stores);
+    const ab = cache.resolve([A, B], stores, generations, INDEX_BITS);
+    const ba = cache.resolve([B, A], stores, generations, INDEX_BITS);
     expect(ab).toBe(ba); // same cached reference
   });
 });

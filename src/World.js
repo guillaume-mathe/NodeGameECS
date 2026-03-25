@@ -1,8 +1,11 @@
 import { QueryCache } from "./Query.js";
+import { SoAStore } from "./SoAStore.js";
+import { Bitset } from "./Bitset.js";
 
 const INDEX_BITS = 20;
 const INDEX_MASK = (1 << INDEX_BITS) - 1;
 const GENERATION_MASK = 0xfff;
+const INITIAL_CAPACITY = 1024;
 
 const extractIndex = (id) => id & INDEX_MASK;
 const extractGeneration = (id) => id >>> INDEX_BITS;
@@ -12,18 +15,20 @@ export class World {
    * @param {{ components?: Array<{ name: string, defaults: object, _id: number }>, registry?: object }} [options]
    */
   constructor({ components, registry } = {}) {
-    /** @type {number[]} per-slot generation counter */
-    this._generations = [];
+    /** @type {number} current slot capacity */
+    this._capacity = INITIAL_CAPACITY;
+    /** @type {Uint16Array} per-slot generation counter */
+    this._generations = new Uint16Array(INITIAL_CAPACITY);
     /** @type {number[]} recycled slot stack */
     this._freeIndices = [];
-    /** @type {Set<number>} live entity IDs */
-    this._alive = new Set();
+    /** @type {Bitset} live slot tracking */
+    this._alive = new Bitset(INITIAL_CAPACITY);
     /** @type {number[]} deferred destruction queue */
     this._pendingDestroy = [];
     /** @type {number} next fresh slot index */
     this._nextIndex = 0;
 
-    /** @type {Map<number, Map<number, object>>} componentId → entityId → data */
+    /** @type {Map<number, { soa: SoAStore, membership: Bitset }>} componentId → SoA store + membership bitset */
     this._stores = new Map();
 
     /** @type {QueryCache} */
@@ -59,6 +64,26 @@ export class World {
     }
   }
 
+  // --- Capacity management ---
+
+  /**
+   * Grow all backing arrays if the slot index exceeds current capacity.
+   * @param {number} slotIndex
+   */
+  _ensureCapacity(slotIndex) {
+    if (slotIndex < this._capacity) return;
+    const newCap = Math.max(this._capacity * 2, slotIndex + 1);
+    this._alive.grow(newCap);
+    const newGen = new Uint16Array(newCap);
+    newGen.set(this._generations);
+    this._generations = newGen;
+    for (const entry of this._stores.values()) {
+      entry.soa.grow(newCap);
+      entry.membership.grow(newCap);
+    }
+    this._capacity = newCap;
+  }
+
   // --- Entity lifecycle ---
 
   /**
@@ -72,11 +97,12 @@ export class World {
       generation = this._generations[index];
     } else {
       index = this._nextIndex++;
+      this._ensureCapacity(index);
       generation = 0;
       this._generations[index] = 0;
     }
     const id = (generation << INDEX_BITS) | index;
-    this._alive.add(id);
+    this._alive.set(index);
     if (this._trackingEnabled) {
       this._dirtyCreated.add(id);
     }
@@ -91,10 +117,7 @@ export class World {
     const index = extractIndex(id);
     const generation = extractGeneration(id);
 
-    // Ensure generations array is large enough
-    while (this._generations.length <= index) {
-      this._generations.push(0);
-    }
+    this._ensureCapacity(index);
     this._generations[index] = generation;
 
     // Ensure _nextIndex is past this slot
@@ -108,7 +131,7 @@ export class World {
       this._freeIndices.splice(freeIdx, 1);
     }
 
-    this._alive.add(id);
+    this._alive.set(index);
     return id;
   }
 
@@ -117,7 +140,7 @@ export class World {
    * @param {number} id
    */
   destroy(id) {
-    if (!this._alive.has(id)) return;
+    if (!this.has(id)) return;
     this._pendingDestroy.push(id);
   }
 
@@ -127,7 +150,8 @@ export class World {
    * @returns {boolean}
    */
   has(id) {
-    return this._alive.has(id);
+    const index = extractIndex(id);
+    return this._alive.has(index) && this._generations[index] === extractGeneration(id);
   }
 
   /**
@@ -135,22 +159,24 @@ export class World {
    */
   _flushDestroy() {
     for (const id of this._pendingDestroy) {
-      if (!this._alive.has(id)) continue;
-      this._alive.delete(id);
+      const index = extractIndex(id);
+      if (!this._alive.has(index) || this._generations[index] !== extractGeneration(id)) continue;
+      this._alive.clear(index);
 
       if (this._trackingEnabled) {
         this._dirtyDestroyed.add(id);
       }
 
       // Remove from all component stores
-      for (const [componentId, store] of this._stores) {
-        if (store.delete(id)) {
+      for (const [componentId, entry] of this._stores) {
+        if (entry.membership.has(index)) {
+          entry.soa.clear(index);
+          entry.membership.clear(index);
           this._queries.invalidate(componentId);
         }
       }
 
       // Recycle the slot with incremented generation
-      const index = extractIndex(id);
       this._generations[index] = (this._generations[index] + 1) & GENERATION_MASK;
       this._freeIndices.push(index);
     }
@@ -162,19 +188,25 @@ export class World {
   /**
    * Add a component to an entity.
    * @param {number} entity
-   * @param {{ name: string, defaults: object, _id: number }} componentType
+   * @param {{ name: string, defaults: object, _id: number, _fields: string[], _schema: object }} componentType
    * @param {object} [overrides]
    */
   add(entity, componentType, overrides) {
-    if (!this._alive.has(entity)) return;
+    if (!this.has(entity)) return;
+    const index = extractIndex(entity);
 
-    let store = this._stores.get(componentType._id);
-    if (!store) {
-      store = new Map();
-      this._stores.set(componentType._id, store);
+    let entry = this._stores.get(componentType._id);
+    if (!entry) {
+      entry = {
+        soa: new SoAStore(componentType, this._capacity),
+        membership: new Bitset(this._capacity),
+      };
+      this._stores.set(componentType._id, entry);
     }
 
-    store.set(entity, { ...componentType.defaults, ...overrides });
+    const data = { ...componentType.defaults, ...overrides };
+    entry.soa.set(index, data);
+    entry.membership.set(index);
 
     // Register type if not already known
     if (!this._registry.has(componentType.name)) {
@@ -194,9 +226,12 @@ export class World {
    * @param {{ _id: number }} componentType
    */
   remove(entity, componentType) {
-    const store = this._stores.get(componentType._id);
-    if (!store) return;
-    if (store.delete(entity)) {
+    const entry = this._stores.get(componentType._id);
+    if (!entry) return;
+    const index = extractIndex(entity);
+    if (entry.membership.has(index)) {
+      entry.soa.clear(index);
+      entry.membership.clear(index);
       if (this._trackingEnabled) {
         this._markComponentRemoved(entity, componentType._id);
       }
@@ -205,14 +240,53 @@ export class World {
   }
 
   /**
-   * Get a component's data for an entity (mutable reference).
+   * Get a component's data for an entity (returns a Proxy that reads/writes through to SoA).
    * @param {number} entity
-   * @param {{ _id: number }} componentType
+   * @param {{ _id: number, _fields: string[], _schema: object }} componentType
    * @returns {object|undefined}
    */
   get(entity, componentType) {
-    const store = this._stores.get(componentType._id);
-    return store ? store.get(entity) : undefined;
+    const entry = this._stores.get(componentType._id);
+    if (!entry) return undefined;
+    const index = extractIndex(entity);
+    if (!entry.membership.has(index)) return undefined;
+
+    const soa = entry.soa;
+    const fields = componentType._fields;
+    const schema = componentType._schema;
+
+    return new Proxy(Object.create(null), {
+      get(_, prop) {
+        if (prop === Symbol.toPrimitive || prop === Symbol.toStringTag) return undefined;
+        if (prop === "toJSON") return () => soa.toObject(index);
+        if (typeof prop === "symbol") return undefined;
+        if (!fields.includes(prop)) return undefined;
+        const val = soa.getField(index, prop);
+        return schema[prop].jsType === "boolean" ? Boolean(val) : val;
+      },
+      set(_, prop, value) {
+        soa.setField(index, prop, value);
+        return true;
+      },
+      ownKeys() {
+        return [...fields];
+      },
+      has(_, prop) {
+        return fields.includes(prop);
+      },
+      getOwnPropertyDescriptor(_, prop) {
+        if (fields.includes(prop)) {
+          const val = soa.getField(index, prop);
+          return {
+            configurable: true,
+            enumerable: true,
+            writable: true,
+            value: schema[prop].jsType === "boolean" ? Boolean(val) : val,
+          };
+        }
+        return undefined;
+      },
+    });
   }
 
   // --- Queries ---
@@ -223,7 +297,7 @@ export class World {
    * @returns {number[]}
    */
   query(...componentTypes) {
-    return this._queries.resolve(componentTypes, this._stores);
+    return this._queries.resolve(componentTypes, this._stores, this._generations, INDEX_BITS);
   }
 
   // --- Systems ---
@@ -291,19 +365,15 @@ export class World {
    */
   serialize() {
     const entities = [];
-    for (const id of this._alive) {
+    const aliveIds = this._alive.toArray(this._generations, INDEX_BITS);
+    for (const id of aliveIds) {
+      const index = extractIndex(id);
       const components = {};
-      for (const [componentId, store] of this._stores) {
-        const data = store.get(id);
-        if (data) {
-          // Find name for this componentId
-          for (const [name, type] of this._registry) {
-            if (type._id === componentId) {
-              components[name] = { ...data };
-              break;
-            }
-          }
-        }
+      for (const [componentId, entry] of this._stores) {
+        if (!entry.membership.has(index)) continue;
+        const name = this._componentName(componentId);
+        if (!name) continue;
+        components[name] = entry.soa.toObject(index);
       }
       entities.push({ id, components });
     }
@@ -316,13 +386,13 @@ export class World {
    */
   deserialize(data) {
     // Clear everything
-    this._alive.clear();
+    this._alive.clearAll();
     this._stores.clear();
     this._queries.clear();
     this._pendingDestroy.length = 0;
     this._freeIndices.length = 0;
     this._nextIndex = 0;
-    this._generations.length = 0;
+    this._generations.fill(0);
 
     for (const entry of data.entities) {
       this._createWithId(entry.id);
@@ -399,25 +469,26 @@ export class World {
    * @param {object} changes
    */
   set(entity, componentType, changes) {
-    const store = this._stores.get(componentType._id);
-    if (!store) return;
-    const data = store.get(entity);
-    if (!data) return;
+    const entry = this._stores.get(componentType._id);
+    if (!entry) return;
+    const index = extractIndex(entity);
+    if (!entry.membership.has(index)) return;
 
     // Transition policy: check equals before marking dirty
     if (this._trackingEnabled && this._componentRegistry) {
-      const entry = this._componentRegistry.get(componentType);
-      if (entry && entry.diffPolicy === "transition" && entry.equals) {
-        const prev = { ...data };
-        Object.assign(data, changes);
-        if (!entry.equals(prev, data)) {
+      const regEntry = this._componentRegistry.get(componentType);
+      if (regEntry && regEntry.diffPolicy === "transition" && regEntry.equals) {
+        const prev = entry.soa.toObject(index);
+        entry.soa.set(index, changes);
+        const curr = entry.soa.toObject(index);
+        if (!regEntry.equals(prev, curr)) {
           this._markDirty(entity, componentType._id);
         }
         return;
       }
     }
 
-    Object.assign(data, changes);
+    entry.soa.set(index, changes);
     if (this._trackingEnabled) {
       this._markDirty(entity, componentType._id);
     }
@@ -430,7 +501,7 @@ export class World {
    */
   markDirty(entity, componentType) {
     if (!this._trackingEnabled) return;
-    if (!this._alive.has(entity)) return;
+    if (!this.has(entity)) return;
     this._markDirty(entity, componentType._id);
   }
 
@@ -444,25 +515,27 @@ export class World {
     if (!this._componentRegistry) return this.serialize();
 
     const entities = [];
-    for (const id of this._alive) {
+    const aliveIds = this._alive.toArray(this._generations, INDEX_BITS);
+    for (const id of aliveIds) {
+      const index = extractIndex(id);
       const components = {};
-      for (const [componentId, store] of this._stores) {
-        const data = store.get(id);
-        if (!data) continue;
+      for (const [componentId, entry] of this._stores) {
+        if (!entry.membership.has(index)) continue;
         const name = this._componentName(componentId);
         if (!name) continue;
         // Check registry for client-only policy
         const type = this._registry.get(name);
         if (type) {
-          const entry = this._componentRegistry.get(type);
-          if (entry && entry.diffPolicy === "client-only") continue;
-          if (entry && entry.serialize) {
-            components[name] = entry.serialize(data);
+          const regEntry = this._componentRegistry.get(type);
+          if (regEntry && regEntry.diffPolicy === "client-only") continue;
+          const data = entry.soa.toObject(index);
+          if (regEntry && regEntry.serialize) {
+            components[name] = regEntry.serialize(data);
           } else {
-            components[name] = { ...data };
+            components[name] = data;
           }
         } else {
-          components[name] = { ...data };
+          components[name] = entry.soa.toObject(index);
         }
       }
       entities.push({ id, components });
@@ -502,14 +575,14 @@ export class World {
     // op: "add" — created entities (not destroyed)
     for (const id of this._dirtyCreated) {
       if (createdAndDestroyed.has(id)) continue;
+      const index = extractIndex(id);
       const components = {};
-      for (const [componentId, store] of this._stores) {
-        const data = store.get(id);
-        if (!data) continue;
+      for (const [componentId, entry] of this._stores) {
+        if (!entry.membership.has(index)) continue;
         const name = this._componentName(componentId);
         if (!name) continue;
         if (this._shouldExcludeFromDiff(name)) continue;
-        components[name] = this._serializeComponent(name, data);
+        components[name] = this._serializeComponent(name, entry.soa.toObject(index));
       }
       entities.push({ id, op: "add", components });
     }
@@ -528,6 +601,7 @@ export class World {
     }
 
     for (const id of updatedEntities) {
+      const index = extractIndex(id);
       const components = {};
       const removed = [];
 
@@ -542,25 +616,24 @@ export class World {
           if (this._componentRegistry) {
             const type = this._registry.get(name);
             if (type) {
-              const entry = this._componentRegistry.get(type);
-              if (entry && entry.diffPolicy === "transition" && entry.equals) {
+              const regEntry = this._componentRegistry.get(type);
+              if (regEntry && regEntry.diffPolicy === "transition" && regEntry.equals) {
                 const lastKey = `${id}:${componentId}`;
                 const last = this._lastFlushed.get(lastKey);
-                const store = this._stores.get(componentId);
-                const current = store ? store.get(id) : undefined;
-                if (last && current && entry.equals(last, current)) continue;
+                const entry = this._stores.get(componentId);
+                const current = entry && entry.membership.has(index) ? entry.soa.toObject(index) : undefined;
+                if (last && current && regEntry.equals(last, current)) continue;
                 // Store current as last flushed
                 if (current) {
-                  this._lastFlushed.set(lastKey, { ...current });
+                  this._lastFlushed.set(lastKey, current);
                 }
               }
             }
           }
 
-          const store = this._stores.get(componentId);
-          const data = store ? store.get(id) : undefined;
-          if (data) {
-            components[name] = this._serializeComponent(name, data);
+          const entry = this._stores.get(componentId);
+          if (entry && entry.membership.has(index)) {
+            components[name] = this._serializeComponent(name, entry.soa.toObject(index));
           }
         }
       }
@@ -576,9 +649,9 @@ export class World {
       }
 
       if (Object.keys(components).length > 0 || removed.length > 0) {
-        const entry = { id, op: "update", components };
-        if (removed.length > 0) entry.removed = removed;
-        entities.push(entry);
+        const diffEntry = { id, op: "update", components };
+        if (removed.length > 0) diffEntry.removed = removed;
+        entities.push(diffEntry);
       }
     }
 
@@ -633,17 +706,16 @@ export class World {
   applyDiff(diff) {
     this._trackingEnabled = false;
 
-    for (const entry of diff.entities) {
-      switch (entry.op) {
+    for (const diffEntry of diff.entities) {
+      switch (diffEntry.op) {
         case "add": {
-          this._createWithId(entry.id);
-          if (entry.components) {
-            for (const [name, compData] of Object.entries(entry.components)) {
+          this._createWithId(diffEntry.id);
+          if (diffEntry.components) {
+            for (const [name, compData] of Object.entries(diffEntry.components)) {
               const type = this._registry.get(name);
               if (type) {
-                // Deserialize if registry provides deserialize function
                 const deserialized = this._deserializeComponent(name, compData);
-                this.add(entry.id, type, deserialized);
+                this.add(diffEntry.id, type, deserialized);
               }
             }
           }
@@ -651,40 +723,42 @@ export class World {
         }
 
         case "update": {
-          if (entry.components) {
-            for (const [name, compData] of Object.entries(entry.components)) {
+          if (diffEntry.components) {
+            for (const [name, compData] of Object.entries(diffEntry.components)) {
               const type = this._registry.get(name);
               if (!type) continue;
-              const store = this._stores.get(type._id);
-              if (store && store.has(entry.id)) {
+              const storeEntry = this._stores.get(type._id);
+              const index = extractIndex(diffEntry.id);
+              if (storeEntry && storeEntry.membership.has(index)) {
                 const deserialized = this._deserializeComponent(name, compData);
-                Object.assign(store.get(entry.id), deserialized);
+                storeEntry.soa.set(index, deserialized);
               } else {
                 // Component is new on this entity
                 const deserialized = this._deserializeComponent(name, compData);
-                this.add(entry.id, type, deserialized);
+                this.add(diffEntry.id, type, deserialized);
               }
             }
           }
-          if (entry.removed) {
-            for (const name of entry.removed) {
+          if (diffEntry.removed) {
+            for (const name of diffEntry.removed) {
               const type = this._registry.get(name);
-              if (type) this.remove(entry.id, type);
+              if (type) this.remove(diffEntry.id, type);
             }
           }
           break;
         }
 
         case "remove": {
-          // Immediate destruction (not deferred)
-          if (this._alive.has(entry.id)) {
-            this._alive.delete(entry.id);
-            for (const [componentId, store] of this._stores) {
-              if (store.delete(entry.id)) {
+          const index = extractIndex(diffEntry.id);
+          if (this._alive.has(index) && this._generations[index] === extractGeneration(diffEntry.id)) {
+            this._alive.clear(index);
+            for (const [componentId, storeEntry] of this._stores) {
+              if (storeEntry.membership.has(index)) {
+                storeEntry.soa.clear(index);
+                storeEntry.membership.clear(index);
                 this._queries.invalidate(componentId);
               }
             }
-            const index = extractIndex(entry.id);
             this._generations[index] = (this._generations[index] + 1) & GENERATION_MASK;
             this._freeIndices.push(index);
           }

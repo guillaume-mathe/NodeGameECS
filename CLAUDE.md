@@ -36,7 +36,7 @@ Produces ESM + IIFE bundles in `dist/` and TypeScript declarations via esbuild +
 
 ### Component (`src/Component.js`)
 
-`defineComponent(name, defaults)` returns a `ComponentType` object with `name`, `defaults` (frozen), and `_id` (auto-incrementing module-level counter). ComponentTypes are global value objects — multiple Worlds can share the same types.
+`defineComponent(name, defaults, options?)` returns a `ComponentType` object with `name`, `defaults` (frozen), `_id` (auto-incrementing module-level counter), `_fields` (field name array), and `_schema` (per-field type/TypedArray constructor mapping). Schema is inferred from defaults: `number` → `Float64Array`, `boolean` → `Uint8Array`, `string` → plain Array. Explicit schema overrides via `options.schema` (e.g. `{ x: "f32" }` → `Float32Array`). ComponentTypes are global value objects — multiple Worlds can share the same types.
 
 ### Prefab (`src/Prefab.js`)
 
@@ -53,7 +53,7 @@ Core ECS container. All game state lives here as mutable component data.
 - **Entity IDs** — generation-based 32-bit integers: bits 0–19 = slot index (up to 1,048,576), bits 20–31 = generation (4,096 before wrap). Stale IDs with old generations fail `has()`.
 - **Entity lifecycle** — `create()` pops from free list or allocates fresh slot; `destroy(id)` queues for deferred removal (flushed at end of `step()`); `has(id)` checks alive set
 - **Prefabs** — `spawn(prefab, overrides?)` creates an entity from a `definePrefab()` template with optional per-component overrides
-- **Component ops** — `add(entity, type, overrides?)` attaches `{ ...defaults, ...overrides }`; `remove(entity, type)` detaches; `get(entity, type)` returns mutable data reference; `set(entity, type, changes)` partial update with dirty tracking; `markDirty(entity, type)` explicit dirty marking
+- **Component ops** — `add(entity, type, overrides?)` writes `{ ...defaults, ...overrides }` to SoA store; `remove(entity, type)` clears slot and membership; `get(entity, type)` returns a Proxy that reads/writes through to SoA arrays; `set(entity, type, changes)` partial update with dirty tracking; `markDirty(entity, type)` explicit dirty marking
 - **Dirty tracking** — all mutations (`create`, `add`, `remove`, `set`, `destroy`) are tracked automatically. `_dirtyCreated`, `_dirtyDestroyed`, `_dirtyComponents`, `_dirtyRemovedComponents` sets/maps. Tracking is suppressed during `applyDiff()`/`applySnapshot()` via `_trackingEnabled` flag.
 - **Diffs** — `flushDiffs()` returns structured diff (`{ entities: [{ id, op, components?, removed? }] }`) and clears dirty state; `applyDiff(diff)` applies diffs to the world (for client reconciliation)
 - **Snapshots** — `snapshot()` returns full serializable state (respects registry policies); `applySnapshot(data)` replaces world state and clears dirty tracking
@@ -61,11 +61,19 @@ Core ECS container. All game state lives here as mutable component data.
 - **Systems** — `addSystem(name?, fn)` registers in insertion order; `removeSystem(nameOrFn)`; `step(ctx)` runs all systems then flushes deferred destroys
 - **Serialization** — `serialize()` returns detached shallow copies; `deserialize(data)` clears world and recreates entities at their original IDs via `_createWithId(id)`
 
-Storage: `Map<componentId, Map<entityId, data>>` — one sparse map per component type.
+Storage: Struct-of-Arrays (SoA) — `Map<componentId, { soa: SoAStore, membership: Bitset }>`. Each `SoAStore` holds one TypedArray per numeric field and one plain Array per string field, indexed by entity slot index. Entity aliveness tracked by a `Bitset`, generations by `Uint16Array`. The `get()` method returns a `Proxy` that reads/writes directly to the underlying typed arrays — this preserves the mutable-reference API while storing data in cache-friendly columnar layout.
+
+### Bitset (`src/Bitset.js`)
+
+Fixed-capacity bitset backed by `Uint32Array`. Used for entity alive tracking and per-component membership. Supports `set`, `clear`, `has`, `grow`, `clearAll`, `count` (popcount), and `toArray(generations, indexBits)` to reconstruct entity IDs from set bits.
+
+### SoAStore (`src/SoAStore.js`)
+
+Struct-of-Arrays storage for a single component type. One TypedArray per numeric/boolean field, one plain Array per string field, all indexed by entity slot index. Supports `set(slot, data)`, `getField`, `setField`, `toObject` (detached copy), `clear` (reset to defaults), and `grow`.
 
 ### Query Cache (`src/Query.js`)
 
-Internal to World, not exported. Cache key = sorted component `_id`s joined as string. Iterates the smallest store and checks `.has()` on the rest. Reverse index (`Map<componentId, Set<queryKey>>`) for efficient invalidation when components are added or removed.
+Internal to World, not exported. Cache key = sorted component `_id`s joined as string. Iterates the smallest membership Bitset (by popcount) and checks `.has()` on the rest. Reconstructs entity IDs from slot indices and generation array. Reverse index (`Map<componentId, Set<queryKey>>`) for efficient invalidation when components are added or removed.
 
 ### Wire Protocol Integration
 
