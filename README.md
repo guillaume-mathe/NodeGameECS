@@ -1,6 +1,6 @@
 # node-game-ecs
 
-Lightweight Entity Component System for [node-game-server](https://github.com) game logic. Provides structured entity/component/system management with built-in dirty tracking, structured diffs, and snapshot/restore for wire protocol integration.
+Lightweight Entity Component System for [node-game-server](https://github.com) game logic. Provides structured entity/component/system management with Struct-of-Arrays (SoA) storage, built-in dirty tracking, structured diffs, and snapshot/restore for wire protocol integration.
 
 ## Install
 
@@ -13,10 +13,13 @@ npm install node-game-ecs
 ```js
 import { World, defineComponent, definePrefab } from "node-game-ecs";
 
-// Define components
+// Define components (schema inferred from defaults: number → Float64Array, string → Array)
 const Position = defineComponent("Position", { x: 0, y: 0 });
 const Velocity = defineComponent("Velocity", { vx: 0, vy: 0 });
 const Player = defineComponent("Player", { id: "", hue: 0 });
+
+// Or with explicit schema overrides for compact storage
+// const Position = defineComponent("Position", { x: 0, y: 0 }, { schema: { x: "f32", y: "f32" } });
 
 // Define prefabs (entity templates)
 const PlayerPrefab = definePrefab([
@@ -90,6 +93,12 @@ clientWorld.applyDiff(updateDiff);
 const snap = world.snapshot();
 clientWorld.applySnapshot(snap);
 ```
+
+## Storage
+
+Component data is stored in **Struct-of-Arrays (SoA)** layout — one TypedArray per numeric field, indexed by entity slot. Entity membership is tracked with Uint32Array-backed **Bitsets**. The `get()` method returns a Proxy that reads/writes directly to the typed arrays, so the familiar mutable-object API is preserved.
+
+Schema types are inferred from defaults (`number` → `Float64Array`, `boolean` → `Uint8Array`, `string` → plain Array), or set explicitly via `options.schema` (e.g. `"f32"` → `Float32Array`).
 
 ## Usage with node-game-server
 

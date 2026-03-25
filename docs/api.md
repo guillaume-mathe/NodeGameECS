@@ -3,12 +3,12 @@
 ## Exports
 
 ```js
-import { defineComponent, definePrefab, World, createComponentRegistry } from "node-game-ecs";
+import { defineComponent, definePrefab, World, createComponentRegistry, Bitset, SoAStore } from "node-game-ecs";
 ```
 
 ---
 
-## `defineComponent(name, defaults?)`
+## `defineComponent(name, defaults?, options?)`
 
 Creates a reusable component type.
 
@@ -18,17 +18,29 @@ Creates a reusable component type.
 |------|------|-------------|
 | `name` | `string` | Unique name, used as serialization key and for debugging |
 | `defaults` | `object` | Default field values (optional, defaults to `{}`) |
+| `options` | `object` | Optional configuration (see below) |
 
-**Returns:** `ComponentType` — `{ name, defaults, _id }`
+**Options:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `schema` | `Record<string, string>` | Per-field type overrides for SoA storage. Keys are field names, values are type strings: `"f32"` (`Float32Array`), `"f64"` (`Float64Array`), `"i32"` (`Int32Array`), `"u8"` (`Uint8Array`), `"i16"` (`Int16Array`), `"u16"` (`Uint16Array`), `"string"` (plain Array). When omitted, types are inferred from defaults: `number` → `f64`, `boolean` → `u8`, `string` → `string`. |
+
+**Returns:** `ComponentType` — `{ name, defaults, _id, _fields, _schema }`
 
 - `defaults` is frozen (shallow). Spread when adding: `{ ...defaults, ...overrides }`.
 - `_id` is an auto-incrementing integer from a module-level counter.
+- `_fields` is an array of field name strings.
+- `_schema` maps each field to `{ type, Ctor, jsType }` where `type` is the storage type string, `Ctor` is the TypedArray constructor (or `null` for strings), and `jsType` is the original JavaScript type.
 - ComponentTypes are global value objects — multiple Worlds can share the same types.
 
 ```js
 const Position = defineComponent("Position", { x: 0, y: 0 });
 const Velocity = defineComponent("Velocity", { vx: 0, vy: 0 });
 const Tag = defineComponent("Tag"); // no data, just a marker
+
+// Explicit schema: use Float32Array instead of the default Float64Array
+const CompactPos = defineComponent("CompactPos", { x: 0, y: 0 }, { schema: { x: "f32", y: "f32" } });
 ```
 
 ---
@@ -129,11 +141,17 @@ No-op if the entity is not alive. Auto-registers the component type in the inter
 
 Detach a component from an entity. Invalidates cached queries involving this component type. Tracks the removal for `flushDiffs()`.
 
-#### `world.get(entity, componentType)` → `object | undefined`
+#### `world.get(entity, componentType)` → `Proxy | undefined`
 
-Get a component's data for an entity. Returns a **mutable reference** to the internal data object — mutations are reflected immediately.
+Get a component's data for an entity. Returns a **Proxy** that reads and writes directly to the underlying SoA (Struct-of-Arrays) typed arrays. Property access and assignment work like a normal object, preserving the mutable-reference API while storing data in cache-friendly columnar layout.
 
 Returns `undefined` if the entity doesn't have the component.
+
+The proxy supports:
+- Property get/set for all fields defined in the component type
+- `ownKeys` / spread (`{ ...proxy }`) — returns all field names
+- `toJSON()` — returns a detached plain object (used by `JSON.stringify`)
+- Boolean fields are coerced from the underlying `Uint8Array` (0/1) to `true`/`false`
 
 **Note:** Direct mutations via `get()` are not automatically tracked. Use `set()` for tracked mutations, or call `markDirty()` after mutating via `get()`.
 
@@ -145,7 +163,7 @@ world.markDirty(entity, Position); // explicitly mark dirty
 
 #### `world.set(entity, componentType, changes)`
 
-Partial update of a component's data with automatic dirty tracking. Merges `changes` into the existing data via `Object.assign`.
+Partial update of a component's data with automatic dirty tracking. Writes only the provided fields to the underlying SoA arrays.
 
 No-op if the entity doesn't have the component. When a registry with `"transition"` diff policy is configured, checks the `equals` function before marking dirty.
 
@@ -261,7 +279,7 @@ Serialize the entire world to a plain object:
 }
 ```
 
-Component data is shallow-copied (`{ ...data }`) — the returned object is detached from the world.
+Component data is extracted from SoA stores into detached plain objects — the returned object is independent of the world.
 
 #### `world.deserialize(data)`
 
@@ -404,10 +422,69 @@ world.has(e2);               // true
 
 ---
 
+## Storage Architecture
+
+Component data is stored in **Struct-of-Arrays (SoA)** layout. Each component type gets one TypedArray per numeric/boolean field and one plain Array per string field, all indexed by entity slot index. This provides cache-friendly memory access patterns for systems iterating over many entities.
+
+Entity membership is tracked with **Bitsets** — fixed-capacity bit arrays backed by `Uint32Array`. There is one global "alive" bitset and one per-component-type membership bitset. Queries iterate the smallest membership bitset (by popcount) and check `.has()` on the rest.
+
+The `get()` method returns a `Proxy` that reads/writes directly to the underlying typed arrays, preserving the familiar mutable-object API while keeping the columnar storage layout.
+
+---
+
+## `Bitset`
+
+Fixed-capacity bitset backed by `Uint32Array`. Used internally for entity alive tracking and per-component membership. Exported for advanced use cases.
+
+### `new Bitset(capacity)`
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `capacity` | `number` | Maximum number of bits |
+
+### Methods
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `set(index)` | — | Set bit at index |
+| `clear(index)` | — | Clear bit at index |
+| `has(index)` | `boolean` | Test bit at index |
+| `grow(newCapacity)` | — | Grow to new capacity, preserving existing bits |
+| `clearAll()` | — | Clear all bits |
+| `count()` | `number` | Population count (number of set bits) |
+| `toArray(generations, indexBits)` | `number[]` | Extract set bit indices as entity IDs using generation lookup |
+
+---
+
+## `SoAStore`
+
+Struct-of-Arrays storage for a single component type. One TypedArray per numeric/boolean field, one plain Array per string field, all indexed by entity slot index. Exported for advanced use cases.
+
+### `new SoAStore(componentType, capacity)`
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `componentType` | `ComponentType` | The component type (must have `_fields`, `_schema`, `defaults`) |
+| `capacity` | `number` | Initial slot capacity |
+
+### Methods
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `set(slotIndex, data)` | — | Write field values from a data object (only writes fields present in `data`) |
+| `getField(slotIndex, fieldName)` | `*` | Read a single field value |
+| `setField(slotIndex, fieldName, value)` | — | Set a single field value |
+| `toObject(slotIndex)` | `object` | Read all fields into a detached plain object |
+| `clear(slotIndex)` | — | Reset slot to component defaults |
+| `grow(newCapacity)` | — | Grow all arrays, preserving existing data |
+
+---
+
 ## Design Notes
 
-- **Mutable data.** `get()` returns a mutable reference. Systems mutate component data in place for performance. Use `set()` or `markDirty()` to track mutations for diffing. Immutable snapshots are created via `snapshot()` or `serialize()`.
+- **SoA storage.** Component data is stored in columnar TypedArrays (one per field) rather than as individual objects. This gives better cache locality when systems iterate a single field across many entities, and allows schema control over numeric precision (e.g. `f32` vs `f64`).
+- **Proxy access.** `get()` returns a Proxy that reads/writes directly to the SoA arrays. Systems mutate component data in place via the proxy for performance. Use `set()` or `markDirty()` to track mutations for diffing. Immutable snapshots are created via `snapshot()` or `serialize()`.
+- **Bitset membership.** Entity aliveness and per-component membership are tracked with Uint32Array-backed bitsets. Queries iterate the smallest bitset and intersect against the rest. This replaces the earlier Map-based approach.
 - **Deferred destruction.** `destroy()` queues; `step()` flushes. This prevents iterator invalidation during system execution. Outside `step()`, call `_flushDestroy()` explicitly.
-- **Flat component data.** Component data should be flat objects with primitive values. Nested objects are not deep-copied by `serialize()`, `snapshot()`, or `add()`.
-- **No bitmasks.** With <1,000 entities and <30 component types, `Map.has()` is negligible vs network I/O. The query API is designed so bitmasks can be added internally later without changing the public surface.
-- **Backward compatible.** All new features (dirty tracking, diffs, snapshots, registry, prefabs) are additive. Existing code using `create()`/`add()`/`get()`/`serialize()` continues to work unchanged. The dirty tracking runs automatically; call `flushDiffs()` only when you need diffs.
+- **Flat component data.** Component data should be flat objects with primitive values. Nested objects are not supported by the SoA storage layer.
+- **Backward compatible.** All new features (SoA storage, dirty tracking, diffs, snapshots, registry, prefabs) are additive. Existing code using `create()`/`add()`/`get()`/`serialize()` continues to work unchanged. The dirty tracking runs automatically; call `flushDiffs()` only when you need diffs.
