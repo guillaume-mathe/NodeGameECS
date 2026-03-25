@@ -1,6 +1,6 @@
 # node-game-ecs
 
-Lightweight Entity Component System for [node-game-server](https://github.com) game logic. Provides structured entity/component/system management while remaining compatible with the existing wire protocol.
+Lightweight Entity Component System for [node-game-server](https://github.com) game logic. Provides structured entity/component/system management with built-in dirty tracking, structured diffs, and snapshot/restore for wire protocol integration.
 
 ## Install
 
@@ -11,20 +11,26 @@ npm install node-game-ecs
 ## Quick Start
 
 ```js
-import { World, defineComponent } from "node-game-ecs";
+import { World, defineComponent, definePrefab } from "node-game-ecs";
 
 // Define components
 const Position = defineComponent("Position", { x: 0, y: 0 });
 const Velocity = defineComponent("Velocity", { vx: 0, vy: 0 });
 const Player = defineComponent("Player", { id: "", hue: 0 });
 
-// Create world and entities
-const world = new World();
+// Define prefabs (entity templates)
+const PlayerPrefab = definePrefab([
+  [Position, { x: 0, y: 0 }],
+  [Velocity, { vx: 0, vy: 0 }],
+  [Player],
+]);
 
-const entity = world.create();
-world.add(entity, Player, { id: "alice", hue: 42 });
-world.add(entity, Position, { x: 100, y: 200 });
-world.add(entity, Velocity, { vx: 1, vy: -1 });
+// Create world and spawn from prefab
+const world = new World();
+const entity = world.spawn(PlayerPrefab, {
+  Player: { id: "alice", hue: 42 },
+  Position: { x: 100, y: 200 },
+});
 
 // Register systems
 world.addSystem("movement", (world, ctx) => {
@@ -40,67 +46,82 @@ world.addSystem("movement", (world, ctx) => {
 world.step({ dtMs: 16 });
 ```
 
-## Usage with node-game-server
+## ECS-Aware Diffing
 
-The ECS World is a mutable internal representation. Game logic uses it for organization, but `tick()` and `onGameEvent()` still return plain state objects for the wire protocol:
+The World tracks all mutations and produces structured diffs for efficient network sync:
 
 ```js
-import { World, defineComponent } from "node-game-ecs";
+import { World, defineComponent, createComponentRegistry } from "node-game-ecs";
 
 const Position = defineComponent("Position", { x: 0, y: 0 });
 const Player = defineComponent("Player", { id: "", hue: 0 });
 
-const world = new World();
+// Optional: registry for custom serialization and diff policies
+const registry = createComponentRegistry();
+registry.register(Position, {
+  id: 0,
+  serialize: (data) => ({ x: data.x, y: data.y }),
+  deserialize: (raw) => ({ x: raw.x, y: raw.y }),
+});
+registry.register(Player, { id: 1 });
 
-function toState(state, ctx) {
-  const players = world.query(Player).map((e) => ({
-    ...world.get(e, Player),
-    ...world.get(e, Position),
-  }));
-  return { frame: ctx.frame, timeMs: state.timeMs + ctx.dtMs, players };
-}
+const world = new World({ components: [Position, Player], registry });
 
-const logic = {
-  createInitialState() {
-    return { frame: 0, timeMs: 0, players: [] };
-  },
+// Create entities — automatically tracked
+const e = world.create();
+world.add(e, Player, { id: "alice", hue: 42 });
+world.add(e, Position, { x: 100, y: 200 });
 
-  tick(state, actions, ctx) {
-    for (const a of actions) {
-      if (a.type === "MOVE") {
-        const entity = findPlayer(a.playerId);
-        if (entity === undefined) continue;
-        const pos = world.get(entity, Position);
-        pos.x += a.dx ?? 0;
-        pos.y += a.dy ?? 0;
-      }
-    }
-    return toState(state, ctx);
-  },
+// Flush diff (returns structured diff and clears dirty state)
+const diff = world.flushDiffs();
+// → { entities: [{ id: 0, op: "add", components: { Position: { x: 100, y: 200 }, Player: { ... } } }] }
 
-  onGameEvent(state, event) {
-    if (event.type === "CONNECT") {
-      const e = world.create();
-      world.add(e, Player, { id: event.playerId, hue: Math.random() * 360 });
-      world.add(e, Position, { x: 400, y: 300 });
-    }
-    if (event.type === "DISCONNECT") {
-      const e = findPlayer(event.playerId);
-      if (e !== undefined) {
-        world.destroy(e);
-        world._flushDestroy();
-      }
-    }
-    return toState(state, { frame: state.frame, dtMs: 0 });
-  },
-};
+// Update with dirty tracking
+world.set(e, Position, { x: 110 });
+const updateDiff = world.flushDiffs();
+// → { entities: [{ id: 0, op: "update", components: { Position: { x: 110, y: 200 } } }] }
 
-function findPlayer(playerId) {
-  for (const e of world.query(Player)) {
-    if (world.get(e, Player).id === playerId) return e;
-  }
-  return undefined;
-}
+// Apply diffs on another world (client-side reconciliation)
+const clientWorld = new World({ components: [Position, Player], registry });
+clientWorld.applyDiff(diff);
+clientWorld.applyDiff(updateDiff);
+
+// Snapshots for rollback
+const snap = world.snapshot();
+clientWorld.applySnapshot(snap);
+```
+
+## Usage with node-game-server
+
+The ECS World can be used in two modes:
+
+**Mode 1: Plain state (existing)** — Game logic converts ECS to plain state objects for the wire protocol via a `toState()` helper.
+
+**Mode 2: ECS-aware diffing (new)** — The server consumes `world.flushDiffs()` directly, and clients apply diffs via `world.applyDiff()`. This provides entity-level and component-level granularity without double work.
+
+```js
+import { World, defineComponent, definePrefab } from "node-game-ecs";
+
+const Position = defineComponent("Position", { x: 0, y: 0 });
+const Player = defineComponent("Player", { id: "", hue: 0 });
+
+const PlayerPrefab = definePrefab([
+  [Position, { x: 400, y: 300 }],
+  [Player],
+]);
+
+const world = new World({ components: [Position, Player] });
+
+// Spawn players from prefab
+const e = world.spawn(PlayerPrefab, {
+  Player: { id: "alice", hue: 42 },
+});
+
+// Update with dirty tracking
+world.set(e, Position, { x: 410, y: 300 });
+
+// Produce diff for the wire
+const diff = world.flushDiffs();
 ```
 
 ## API
